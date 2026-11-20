@@ -1,0 +1,107 @@
+
+name: TorLabAndr - upstream Android test build
+
+on:
+  workflow_dispatch:
+    inputs:
+      abi:
+        description: Android ABI
+        required: true
+        type: choice
+        options:
+          - arm64-v8a
+          - armeabi-v7a
+        default: arm64-v8a
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      RBM_NO_DEBUG: "1"
+      RBM_NUM_PROCS: "2"
+    steps:
+      - name: Show runner resources
+        run: |
+          set -eux
+          df -h
+          free -h || true
+          nproc
+
+      - name: Install Tor Browser build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git make python3 python3-venv \
+            uidmap zstd tar jq zip unzip \
+            libdata-dump-perl libdata-uuid-perl libdatetime-perl \
+            libdigest-sha-perl libfile-copy-recursive-perl \
+            libfile-slurp-perl libio-all-perl libcapture-tiny-perl \
+            libio-handle-util-perl libjson-perl \
+            libparallel-forkmanager-perl libpath-tiny-perl \
+            libsort-versions-perl libstring-shellquote-perl \
+            libtemplate-perl libxml-libxml-perl libxml-writer-perl \
+            libyaml-libyaml-perl
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+
+      - name: Enable unprivileged user namespaces for RBM containers
+        run: |
+          set -eux
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          sysctl kernel.apparmor_restrict_unprivileged_userns
+
+      - name: Clone official Tor Browser build system
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 https://gitlab.torproject.org/tpo/applications/tor-browser-build.git tor-browser-build
+          cd tor-browser-build
+          make submodule-update
+
+      - name: Build official Tor Browser Android test APK
+        working-directory: tor-browser-build
+        shell: bash
+        run: |
+          set -euxo pipefail
+          case "${{ inputs.abi }}" in
+            arm64-v8a) TARGET="torbrowser-testbuild-android-aarch64" ;;
+            armeabi-v7a) TARGET="torbrowser-testbuild-android-armv7" ;;
+            *) echo "Unsupported ABI" >&2; exit 2 ;;
+          esac
+          echo "Building upstream target: $TARGET"
+          make "$TARGET"
+
+      - name: Collect APKs and build provenance
+        if: always()
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p output
+          find tor-browser-build -type f -name '*.apk' -print -exec cp --parents '{}' output/ \; || true
+          if [ -d tor-browser-build/torbrowser ]; then
+            find tor-browser-build/torbrowser -type f \( -name '*.apk' -o -name 'sha256sums*' \) -print
+          fi
+          {
+            echo "ABI=${{ inputs.abi }}"
+            echo "UPSTREAM_REPOSITORY=https://gitlab.torproject.org/tpo/applications/tor-browser-build"
+            echo "UPSTREAM_COMMIT=$(git -C tor-browser-build rev-parse HEAD)"
+            echo "GITHUB_RUN_ID=$GITHUB_RUN_ID"
+          } > output/BUILD-INFO.txt
+          if find output -type f -name '*.apk' | grep -q .; then
+            find output -type f -name '*.apk' -exec sha256sum '{}' \; > output/SHA256SUMS.txt
+          else
+            echo "No APK found; build logs must be inspected." > output/NO-APK.txt
+          fi
+
+      - name: Upload build output and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: TorLabAndr-upstream-${{ inputs.abi }}
+          path: |
+            output/
+          if-no-files-found: warn
+          retention-days: 7
